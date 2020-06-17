@@ -189,6 +189,50 @@ def chrf_signature(args, numrefs):
     return sigstr
 
 
+def gleu_signature(args, numrefs):
+    """
+    Builds a signature that uniquely identifies the scoring parameters used.
+    :param args: the arguments passed into the script
+    :return: the signature
+    """
+
+    # Abbreviations for the signature
+    abbr = {
+        'test': 't',
+        'lang': 'l',
+        'case': 'c',
+        'tok': 'tok',
+        'numrefs': '#',
+        'version': 'v',
+        'origlang': 'o',
+        'subset': 'S',
+    }
+
+    signature = {'tok': args.tokenize,
+                 'version': VERSION,
+                 'numrefs': numrefs,
+                 'case': 'lc' if args.lc else 'mixed'}
+
+    # For the Japanese tokenizer, add a dictionary type and its version to the signature.
+    if args.tokenize == "ja-mecab":
+        signature['tok'] += "-" + TokenizeMeCab().signature()
+
+    if args.test_set is not None:
+        signature['test'] = args.test_set
+
+    if args.langpair is not None:
+        signature['lang'] = args.langpair
+
+    if args.origlang is not None:
+        signature['origlang'] = args.origlang
+    if args.subset is not None:
+        signature['subset'] = args.subset
+
+    sigstr = '+'.join(['{}.{}'.format(abbr[x] if args.short else x, signature[x]) for x in sorted(signature.keys())])
+
+    return sigstr
+
+
 def extract_ngrams(line, min_order=1, max_order=NGRAM_ORDER) -> Counter:
     """Extracts all the ngrams (min_order <= n <= max_order) from a sequence of tokens.
 
@@ -493,6 +537,16 @@ class CHRF(Result):
         return '{score:.{width}f}'.format(score=self.score, width=width)
 
 
+class GLEU(Result):
+    def __init__(self,
+            score: float):
+        super().__init__(score)
+
+    def format(self, width=2):
+        return 'GLEU = {score:.{width}f}'.format(
+            score=self.score, width=width)
+
+
 def compute_bleu(correct: List[int],
                  total: List[int],
                  sys_len: int,
@@ -661,6 +715,100 @@ def raw_corpus_bleu(sys_stream,
     :param ref_streams: a list of one or more reference streams (each a sequence of segments)
     """
     return corpus_bleu(sys_stream, ref_streams, smooth_method='floor', smooth_value=smooth_value, force=True, tokenize='none', use_effective_order=True)
+
+
+def corpus_gleu(sys_stream: Union[str, Iterable[str]],
+                ref_streams: Union[str, List[Iterable[str]]],
+                force=False,
+                lowercase=False,
+                tokenize=DEFAULT_TOKENIZER) -> GLEU:
+    """Produces GLEU scores along with its sufficient statistics from a source against one or more references.
+
+    :param sys_stream: The system stream (a sequence of segments)
+    :param ref_streams: A list of one or more reference streams (each a sequence of segments)
+    :param force: Ignore data that looks already tokenized
+    :param lowercase: Lowercase the data
+    :param tokenize: The tokenizer to use
+    :return: a BLEU object containing everything you'd want
+    """
+
+    # Add some robustness to the input arguments
+    if isinstance(sys_stream, str):
+        sys_stream = [sys_stream]
+    if isinstance(ref_streams, str):
+        ref_streams = [[ref_streams]]
+
+    sys_len = 0
+    ref_len = 0
+
+    correct = [0 for n in range(NGRAM_ORDER)]
+    total = [0 for n in range(NGRAM_ORDER)]
+
+    # look for already-tokenized sentences
+    tokenized_count = 0
+
+    fhs = [sys_stream] + ref_streams
+
+    corpus_n_match = 0
+    corpus_n_all = 0
+
+    for lines in zip_longest(*fhs):
+        if None in lines:
+            raise EOFError("Source and reference streams have different lengths!")
+
+        if lowercase:
+            lines = [x.lower() for x in lines]
+
+        if not (force or tokenize == 'none') and lines[0].rstrip().endswith(' .'):
+            tokenized_count += 1
+
+            if tokenized_count == 100:
+                logging.warning('That\'s 100 lines that end in a tokenized period (\'.\')')
+                logging.warning('It looks like you forgot to detokenize your test data, which may hurt your score.')
+                logging.warning('If you insist your data is detokenized, or don\'t care, you can suppress this message with \'--force\'.')
+
+        output, *refs = [TOKENIZERS[tokenize](x.rstrip()) for x in lines]
+
+        sys_ngrams = extract_ngrams(output)
+        tpfp = sum(sys_ngrams.values())  # True positives + False positives.
+        sys_counts = []
+
+        for ref in refs:
+            ref_ngrams, closest_diff, closest_len = ref_stats(output, [ref])
+            tpfn = sum(ref_ngrams.values())
+            
+            overlap_ngrams = ref_ngrams & sys_ngrams
+            tp = sum(overlap_ngrams.values())  # True positives.
+            n_all = max(tpfp, tpfn)
+            if n_all > 0:
+                sys_counts.append((tp, n_all))
+
+        if sys_counts:
+            n_match, n_all = max(sys_counts, key=lambda hc: hc[0] / hc[1])
+            corpus_n_match += n_match
+            corpus_n_all += n_all
+
+    # corner case: empty corpus or empty references---don't divide by zero!
+    if corpus_n_all == 0:
+        gleu_score = 0.0
+    else:
+        gleu_score = corpus_n_match / corpus_n_all
+
+    return GLEU(gleu_score)
+
+
+def sentence_gleu(hypothesis: str,
+                  references: List[str]) -> GLEU:
+    """
+    Computes GLEU on a single sentence pair.
+
+
+    :param hypothesis: Hypothesis string.
+    :param reference: Reference string.
+    :return: Returns a single BLEU score as a float.
+    """
+    gleu = corpus_gleu(hypothesis, references)
+    return gleu
 
 
 def delete_whitespace(text: str) -> str:
@@ -924,7 +1072,7 @@ def main():
         else:
             args.tokenize = DEFAULT_TOKENIZER
 
-    if args.langpair is not None and 'bleu' in args.metrics:
+    if args.langpair is not None and ('bleu' in args.metrics or 'gleu' in args.metrics):
         if args.langpair.split('-')[1] == 'zh' and args.tokenize != 'zh':
             logging.warning('You should also pass "--tok zh" when scoring Chinese...')
         if args.langpair.split('-')[1] == 'ja' and not args.tokenize.startswith('ja-'):
@@ -990,6 +1138,10 @@ def main():
                                          args.chrf_beta,
                                          remove_whitespace=not args.chrf_whitespace)
                     results.append(chrf)
+                if metric == 'gleu':
+                    gleu = sentence_gleu(output,
+                                         [[x] for x in references])
+                    results.append(gleu)
 
             display_metric(args.metrics, results, len(refs), args)
 
@@ -1005,6 +1157,9 @@ def main():
             elif metric == 'chrf':
                 chrf = corpus_chrf(system, refs[0], beta=args.chrf_beta, order=args.chrf_order, remove_whitespace=not args.chrf_whitespace)
                 results.append(chrf)
+            elif metric == 'gleu':
+                gleu = corpus_gleu(system, refs, force=args.force, lowercase=args.lc, tokenize=args.tokenize)
+                results.append(gleu)
     except EOFError:
         logging.error('The input and reference stream(s) were of different lengths.')
         if args.test_set is not None:
@@ -1045,6 +1200,9 @@ def main():
                 if 'chrf' in args.metrics:
                     chrf = corpus_chrf(system, refs[0], beta=args.chrf_beta, order=args.chrf_order, remove_whitespace=not args.chrf_whitespace)
                     print('origlang={} {}: sentences={:{}} chrF={:{}.{}f}'.format(origlang, subset_str, len(system), sents_digits, chrf.score, width+4, width))
+                if 'gleu' in args.metrics:
+                    gleu = corpus_gleu(system, refs, force=args.force, lowercase=args.lc, tokenize=args.tokenize)
+                    print('origlang={} {}: sentences={:{}} GLEU={:{}.{}f}'.format(origlang, subset_str, len(system), sents_digits, gleu.score, width+4, width))
 
 
 def display_metric(metrics_to_print, results, num_refs, args):
@@ -1067,6 +1225,13 @@ def display_metric(metrics_to_print, results, num_refs, args):
             else:
                 version_str = chrf_signature(args, num_refs)
                 print('chrF{0:d}+{1} = {2:.{3}f}'.format(args.chrf_beta, version_str, result.score, args.width))
+        
+        elif metric == 'gleu':
+            if args.score_only:
+                print('{0:.{1}f}'.format(result.score, args.width))
+            else:
+                version_str = gleu_signature(args, num_refs)
+                print(result.format(args.width).replace('GLEU', 'GLEU+' + version_str))
 
 
 def parse_args():
@@ -1106,7 +1271,7 @@ def parse_args():
                             help='Split the reference stream on tabs, and expect this many references. Default: %(default)s.')
     arg_parser.add_argument('refs', nargs='*', default=[],
                             help='optional list of references (for backwards-compatibility with older scripts)')
-    arg_parser.add_argument('--metrics', '-m', choices=['bleu', 'chrf'], nargs='+',
+    arg_parser.add_argument('--metrics', '-m', choices=['bleu', 'chrf', 'gleu'], nargs='+',
                             default=['bleu'],
                             help='metrics to compute (default: bleu)')
     arg_parser.add_argument('--chrf-order', type=int, default=CHRF_ORDER,
